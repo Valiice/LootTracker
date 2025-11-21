@@ -1,0 +1,16 @@
+{
+  "Author": "Vali",
+  "Name": "Drop Rate Logger",
+  "InternalName": "DropLogger",
+  "AssemblyVersion": "1.0.0.0",
+  "Description": "Loot Tracking System",
+  "Punchline": "Logs drops to server",
+  "ApplicableVersion": "any",
+  "RepoUrl": "",
+  "Tags": [ "loot", "tracker" ],
+  "DalamudApiLevel": 13,
+  "LoadRequiredState": 0,
+  "LoadSync": false,
+  "CanUnloadAsync": true,
+  "ImageUrls": []
+}
