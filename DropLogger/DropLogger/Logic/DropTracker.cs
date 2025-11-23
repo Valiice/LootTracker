@@ -1,55 +1,60 @@
-﻿using Dalamud.Game.Text;
-using Dalamud.Game.Text.SeStringHandling;
-using Dalamud.Game.Text.SeStringHandling.Payloads;
-using Dalamud.Plugin.Services;
-using Lumina.Excel.Sheets;
+﻿using Dalamud.Plugin.Services;
+using LuminaItem = Lumina.Excel.Sheets.Item;
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using FFXIVClientStructs.FFXIV.Client.Game;
+using Dalamud.Game.ClientState.Objects.Types;
+using Dalamud.Game.ClientState.Objects.Enums;
 
 namespace DropLogger.Logic
 {
     public class DropTracker : IDisposable
     {
         private readonly Config _config;
-        private readonly IChatGui _chat;
         private readonly IClientState _clientState;
         private readonly IPluginLog _pluginLog;
         private readonly IDataManager _data;
+        private readonly IObjectTable _objectTable;
+        private readonly IFramework _framework;
 
         private static readonly HttpClient _httpClient = new();
-        private readonly Regex _dropRegex = new(@"You obtain (an? )?(\d+ )?(.+?)\.", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-        private readonly Regex _killRegex = new(@"You defeat the (.+?)\.", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-
         private readonly List<DropData> _dropBuffer = [];
         private DateTime _lastUploadTime = DateTime.UtcNow;
-
         private readonly Lock _bufferLock = new();
 
         private string _lastKilledMob = "Unknown";
         private int _lastKilledMobId = 0;
         private DateTime _lastKillTime = DateTime.MinValue;
 
-        public DropTracker(Config config, IChatGui chat, IClientState clientState, IPluginLog pluginLog, IDataManager data)
+        private readonly HashSet<ulong> _deadMobs = [];
+        private readonly Dictionary<uint, int> _inventorySnapshot = [];
+        private DateTime _lastInventoryScan = DateTime.MinValue;
+
+        public DropTracker(Config config, IClientState clientState, IPluginLog pluginLog, IDataManager data, IObjectTable objectTable, IFramework framework)
         {
             _config = config;
-            _chat = chat;
             _clientState = clientState;
             _pluginLog = pluginLog;
             _data = data;
+            _objectTable = objectTable;
+            _framework = framework;
 
-            _chat.ChatMessage += OnChatMessage;
+            _framework.Update += OnUpdate;
+            _clientState.TerritoryChanged += OnTerritoryChanged;
+
+            InitializeInventorySnapshot();
         }
 
         public void Dispose()
         {
-            _chat.ChatMessage -= OnChatMessage;
+            _framework.Update -= OnUpdate;
+            _clientState.TerritoryChanged -= OnTerritoryChanged;
 
             lock (_bufferLock)
             {
@@ -62,107 +67,147 @@ namespace DropLogger.Logic
                     catch (Exception ex) { _pluginLog.Error(ex, "Failed to upload on shutdown"); }
                 }
             }
-
             GC.SuppressFinalize(this);
         }
 
-        private void OnChatMessage(XivChatType type, int timestamp, ref SeString sender, ref SeString message, ref bool isHandled)
+        private void OnTerritoryChanged(ushort id)
+        {
+            _deadMobs.Clear();
+        }
+
+        private void OnUpdate(IFramework framework)
         {
             if (!_config.IsLoggingEnabled) return;
+            if (_clientState.LocalPlayer == null) return;
 
-            var msgText = message.ToString();
+            CheckForKills();
 
-            var killMatch = _killRegex.Match(msgText);
-            if (killMatch.Success)
+            if ((DateTime.UtcNow - _lastInventoryScan).TotalMilliseconds > 500)
             {
-                HandleKill(killMatch);
-                return;
-            }
-
-            var dropMatch = _dropRegex.Match(msgText);
-            if (dropMatch.Success)
-            {
-                HandleDrop(dropMatch, message);
-                return;
+                CheckForLoot();
+                _lastInventoryScan = DateTime.UtcNow;
             }
         }
 
-        private void HandleKill(Match match)
+        private void CheckForKills()
         {
-            try
+            foreach (var actor in _objectTable)
             {
-                string mobName = match.Groups[1].Value;
-                uint mobId = 0;
-                string officialName = mobName;
+                if (actor.ObjectKind != ObjectKind.BattleNpc) continue;
 
-                var mobSheet = _data.GetExcelSheet<BNpcName>();
-                if (mobSheet != null)
+                var battleNpc = (IBattleNpc)actor;
+
+                if (battleNpc.IsDead || battleNpc.CurrentHp == 0)
                 {
-                    var mobRow = mobSheet.FirstOrDefault(x => x.Singular.ToString().Equals(mobName, StringComparison.OrdinalIgnoreCase));
+                    if (_deadMobs.Contains(actor.GameObjectId)) continue;
 
-                    if (mobRow.RowId != 0)
+                    var dist = System.Numerics.Vector3.Distance(_clientState.LocalPlayer!.Position, actor.Position);
+                    if (dist < 40.0f)
                     {
-                        mobId = mobRow.RowId;
-                        officialName = mobRow.Singular.ToString();
+                        HandleKill(battleNpc);
                     }
-                }
-
-                _lastKilledMob = officialName;
-                _lastKilledMobId = (int)mobId;
-                _lastKillTime = DateTime.UtcNow;
-
-                LogAndBuffer($"MOB-{officialName}", (int)mobId, 1, false, true);
-            }
-            catch (Exception ex) { _pluginLog.Error(ex, "Error parsing kill"); }
-        }
-
-        private void HandleDrop(Match match, SeString message)
-        {
-            try
-            {
-                string quantityStr = match.Groups[2].Value;
-                int quantity = 1;
-                if (!string.IsNullOrWhiteSpace(quantityStr)) int.TryParse(quantityStr.Trim(), out quantity);
-
-                bool isHq = match.Groups[3].Value.Contains('');
-                string cleanName = match.Groups[3].Value.Replace("", "").Trim();
-                string lowerName = cleanName.ToLower();
-
-                int itemId = 0;
-
-                if (message.Payloads.FirstOrDefault(p => p is ItemPayload) is ItemPayload itemPayload)
-                {
-                    itemId = (int)itemPayload.ItemId;
-
-                    if ((itemId > 0 && itemId < 100) || itemId == 21072)
-                    {
-                        _pluginLog.Debug($"[Ignored] Currency ID: {cleanName} ({itemId})");
-                        return;
-                    }
-
-                    var itemSheet = _data.GetExcelSheet<Item>();
-                    if (itemSheet != null && itemSheet.TryGetRow((uint)itemId, out var itemRow))
-                    {
-                        if (itemRow.ItemUICategory.Value.RowId == 63)
-                        {
-                            _pluginLog.Debug($"[Ignored] Key Item: {cleanName} ({itemId})");
-                            return;
-                        }
-
-                        cleanName = itemRow.Name.ToString();
-                    }
+                    _deadMobs.Add(actor.GameObjectId);
                 }
                 else
                 {
-                    if (lowerName.Contains("gil") ||
-                        lowerName.Contains("tomestone") ||
-                        lowerName.Contains("venture") ||
-                        lowerName.Contains("seal") ||
-                        lowerName.Contains("materia"))
+                    if (_deadMobs.Contains(actor.GameObjectId)) _deadMobs.Remove(actor.GameObjectId);
+                }
+            }
+        }
+
+        private unsafe void CheckForLoot()
+        {
+            var manager = InventoryManager.Instance();
+            if (manager == null) return;
+
+            var currentCounts = new Dictionary<uint, int>();
+
+            for (int i = 0; i < 4; i++)
+            {
+                var container = manager->GetInventoryContainer((InventoryType)((int)InventoryType.Inventory1 + i));
+                if (container == null) continue;
+
+                for (int slot = 0; slot < container->Size; slot++)
+                {
+                    var item = container->GetInventorySlot(slot);
+                    if (item == null || item->ItemId == 0) continue;
+
+                    if (!currentCounts.ContainsKey(item->ItemId)) currentCounts[item->ItemId] = 0;
+                    currentCounts[item->ItemId] += (int)item->Quantity;
+                }
+            }
+
+            foreach (var kvp in currentCounts)
+            {
+                var itemId = kvp.Key;
+                var count = kvp.Value;
+
+                int oldCount = 0;
+                if (_inventorySnapshot.ContainsKey(itemId)) oldCount = _inventorySnapshot[itemId];
+
+                if (count > oldCount)
+                {
+                    int diff = count - oldCount;
+                    HandleDrop(itemId, diff);
+                }
+            }
+
+            _inventorySnapshot.Clear();
+            foreach (var kvp in currentCounts) _inventorySnapshot[kvp.Key] = kvp.Value;
+        }
+
+        private unsafe void InitializeInventorySnapshot()
+        {
+            var manager = InventoryManager.Instance();
+            if (manager == null) return;
+
+            _inventorySnapshot.Clear();
+            for (int i = 0; i < 4; i++)
+            {
+                var container = manager->GetInventoryContainer((InventoryType)((int)InventoryType.Inventory1 + i));
+                if (container == null) continue;
+
+                for (int slot = 0; slot < container->Size; slot++)
+                {
+                    var item = container->GetInventorySlot(slot);
+                    if (item != null && item->ItemId != 0)
                     {
-                        _pluginLog.Debug($"[Ignored] Currency Text: {cleanName}");
-                        return;
+                        if (!_inventorySnapshot.ContainsKey(item->ItemId)) _inventorySnapshot[item->ItemId] = 0;
+                        _inventorySnapshot[item->ItemId] += (int)item->Quantity;
                     }
+                }
+            }
+        }
+
+        private void HandleKill(IBattleNpc actor)
+        {
+            try
+            {
+                var name = actor.Name.ToString();
+                var mobId = (int)actor.NameId;
+
+                _lastKilledMob = name;
+                _lastKilledMobId = mobId;
+                _lastKillTime = DateTime.UtcNow;
+
+                LogAndBuffer($"MOB-{name}", mobId, 1, false, true);
+            }
+            catch (Exception ex) { _pluginLog.Error(ex, "Error handling kill"); }
+        }
+
+        private void HandleDrop(uint itemId, int quantity)
+        {
+            try
+            {
+                if ((itemId > 0 && itemId < 100) || itemId == 21072) return;
+
+                var itemSheet = _data.GetExcelSheet<LuminaItem>();
+                string cleanName = "Unknown Item";
+
+                if (itemSheet != null && itemSheet.TryGetRow(itemId, out var itemRow))
+                {
+                    if (itemRow.ItemUICategory.Value.RowId == 63) return;
+                    cleanName = itemRow.Name.ToString();
                 }
 
                 string sourceMob = "Unknown";
@@ -174,9 +219,9 @@ namespace DropLogger.Logic
                     sourceMobId = _lastKilledMobId;
                 }
 
-                LogAndBuffer(cleanName, itemId, quantity, isHq, false, sourceMob, sourceMobId);
+                LogAndBuffer(cleanName, (int)itemId, quantity, false, false, sourceMob, sourceMobId);
             }
-            catch (Exception ex) { _pluginLog.Error(ex, "Error parsing drop"); }
+            catch (Exception ex) { _pluginLog.Error(ex, "Error handling drop"); }
         }
 
         private void LogAndBuffer(string name, int itemId, int quantity, bool isHq, bool isMob, string sourceMob = null, int sourceMobId = 0)
