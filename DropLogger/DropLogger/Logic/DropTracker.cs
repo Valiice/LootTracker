@@ -3,7 +3,6 @@ using LuminaItem = Lumina.Excel.Sheets.Item;
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Net.Http;
 using System.Text;
 using System.Threading;
@@ -135,7 +134,6 @@ namespace DropLogger.Logic
                         }
                     }
 
-                    // Also check if WE are targeting the mob (even if it's not targeting us yet/anymore)
                     if (!isAggroed && player.TargetObjectId == actor.GameObjectId)
                     {
                         isAggroed = true;
@@ -146,7 +144,6 @@ namespace DropLogger.Logic
                         HandleKill(battleNpc);
                     }
 
-                    // Always add to dead mobs list so we don't re-process it, even if we ignored it
                     _deadMobs.Add(actor.GameObjectId);
                 }
                 else
