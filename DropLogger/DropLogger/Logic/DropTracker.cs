@@ -9,6 +9,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using FFXIVClientStructs.FFXIV.Client.Game;
+using FFXIVClientStructs.FFXIV.Component.GUI;
 using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Game.ClientState.Objects.Enums;
 
@@ -22,6 +23,8 @@ namespace DropLogger.Logic
         private readonly IDataManager _data;
         private readonly IObjectTable _objectTable;
         private readonly IFramework _framework;
+        private readonly IGameGui _gameGui;
+        private readonly IPartyList _partyList;
 
         private static readonly HttpClient _httpClient = new();
         private readonly List<DropData> _dropBuffer = [];
@@ -36,7 +39,9 @@ namespace DropLogger.Logic
         private readonly Dictionary<uint, int> _inventorySnapshot = [];
         private DateTime _lastInventoryScan = DateTime.MinValue;
 
-        public DropTracker(Config config, IClientState clientState, IPluginLog pluginLog, IDataManager data, IObjectTable objectTable, IFramework framework)
+        private readonly HashSet<uint> _seenRollIds = [];
+
+        public DropTracker(Config config, IClientState clientState, IPluginLog pluginLog, IDataManager data, IObjectTable objectTable, IFramework framework, IGameGui gameGui, IPartyList partyList)
         {
             _config = config;
             _clientState = clientState;
@@ -44,6 +49,8 @@ namespace DropLogger.Logic
             _data = data;
             _objectTable = objectTable;
             _framework = framework;
+            _gameGui = gameGui;
+            _partyList = partyList;
 
             _framework.Update += OnUpdate;
             _clientState.TerritoryChanged += OnTerritoryChanged;
@@ -73,6 +80,7 @@ namespace DropLogger.Logic
         private void OnTerritoryChanged(ushort id)
         {
             _deadMobs.Clear();
+            _seenRollIds.Clear();
         }
 
         private void OnUpdate(IFramework framework)
@@ -85,12 +93,16 @@ namespace DropLogger.Logic
             if ((DateTime.UtcNow - _lastInventoryScan).TotalMilliseconds > 500)
             {
                 CheckForLoot();
+                CheckForLootRolls();
                 _lastInventoryScan = DateTime.UtcNow;
             }
         }
 
         private void CheckForKills()
         {
+            var player = _clientState.LocalPlayer;
+            if (player == null) return;
+
             foreach (var actor in _objectTable)
             {
                 if (actor.ObjectKind != ObjectKind.BattleNpc) continue;
@@ -101,16 +113,79 @@ namespace DropLogger.Logic
                 {
                     if (_deadMobs.Contains(actor.GameObjectId)) continue;
 
-                    var dist = System.Numerics.Vector3.Distance(_clientState.LocalPlayer!.Position, actor.Position);
-                    if (dist < 40.0f)
+                    var dist = System.Numerics.Vector3.Distance(player.Position, actor.Position);
+                    if (dist > 40.0f) continue;
+
+                    bool isAggroed = false;
+                    ulong targetId = battleNpc.TargetObjectId;
+
+                    if (targetId == player.GameObjectId)
+                    {
+                        isAggroed = true;
+                    }
+                    else if (_partyList.Length > 0)
+                    {
+                        foreach (var member in _partyList)
+                        {
+                            if (member.GameObject != null && member.GameObject.GameObjectId == targetId)
+                            {
+                                isAggroed = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Also check if WE are targeting the mob (even if it's not targeting us yet/anymore)
+                    if (!isAggroed && player.TargetObjectId == actor.GameObjectId)
+                    {
+                        isAggroed = true;
+                    }
+
+                    if (isAggroed)
                     {
                         HandleKill(battleNpc);
                     }
+
+                    // Always add to dead mobs list so we don't re-process it, even if we ignored it
                     _deadMobs.Add(actor.GameObjectId);
                 }
                 else
                 {
                     if (_deadMobs.Contains(actor.GameObjectId)) _deadMobs.Remove(actor.GameObjectId);
+                }
+            }
+        }
+
+        private unsafe void CheckForLootRolls()
+        {
+            var addonPtr = _gameGui.GetAddonByName("Loot", 1);
+
+            if (addonPtr.Address == nint.Zero) return;
+
+            var addon = (AtkUnitBase*)addonPtr.Address;
+
+            if (addon == null || !addon->IsVisible) return;
+
+            var count = addon->AtkValuesCount;
+            var values = addon->AtkValues;
+
+            for (int i = 0; i < count; i++)
+            {
+                var val = values[i];
+                if (val.Type != FFXIVClientStructs.FFXIV.Component.GUI.ValueType.Int) continue;
+
+                uint possibleItemId = (uint)val.Int;
+                if (possibleItemId < 100 || possibleItemId > 40000) continue;
+
+                if (_data.GetExcelSheet<LuminaItem>()?.HasRow(possibleItemId) == true)
+                {
+                    uint pseudoId = (uint)((i << 16) | possibleItemId);
+
+                    if (!_seenRollIds.Contains(pseudoId))
+                    {
+                        HandleChestDrop(possibleItemId);
+                        _seenRollIds.Add(pseudoId);
+                    }
                 }
             }
         }
@@ -190,12 +265,22 @@ namespace DropLogger.Logic
                 _lastKilledMobId = mobId;
                 _lastKillTime = DateTime.UtcNow;
 
-                LogAndBuffer($"MOB-{name}", mobId, 1, false, true);
+                LogAndBuffer($"MOB-{name}", mobId, 1, false, true, null, null, "Kill");
             }
             catch (Exception ex) { _pluginLog.Error(ex, "Error handling kill"); }
         }
 
         private void HandleDrop(uint itemId, int quantity)
+        {
+            ProcessLootItem(itemId, quantity, "Inventory");
+        }
+
+        private void HandleChestDrop(uint itemId)
+        {
+            ProcessLootItem(itemId, 1, "Chest Roll");
+        }
+
+        private void ProcessLootItem(uint itemId, int quantity, string source)
         {
             try
             {
@@ -213,25 +298,25 @@ namespace DropLogger.Logic
                 string sourceMob = "Unknown";
                 int sourceMobId = 0;
 
-                if ((DateTime.UtcNow - _lastKillTime).TotalSeconds < 5)
+                if ((DateTime.UtcNow - _lastKillTime).TotalSeconds < 30)
                 {
                     sourceMob = _lastKilledMob;
                     sourceMobId = _lastKilledMobId;
                 }
 
-                LogAndBuffer(cleanName, (int)itemId, quantity, false, false, sourceMob, sourceMobId);
+                LogAndBuffer(cleanName, (int)itemId, quantity, false, false, sourceMob, sourceMobId, source);
             }
-            catch (Exception ex) { _pluginLog.Error(ex, "Error handling drop"); }
+            catch (Exception ex) { _pluginLog.Error(ex, "Error handling loot item"); }
         }
 
-        private void LogAndBuffer(string name, int itemId, int quantity, bool isHq, bool isMob, string sourceMob = null, int sourceMobId = 0)
+        private void LogAndBuffer(string name, int itemId, int quantity, bool isHq, bool isMob, string sourceMob, int? sourceMobId, string sourceMethod)
         {
             ushort zoneId = _clientState.TerritoryType;
             string userHash = _clientState.LocalContentId == 0 ? "000000" : _clientState.LocalContentId.ToString("X");
 
             if (_config.EnableDebugLogging)
             {
-                _pluginLog.Debug($"[Tracking] {quantity}x {name} (ID: {itemId} | Zone: {zoneId})");
+                _pluginLog.Debug($"[Tracking] [{sourceMethod}] {quantity}x {name} (ID: {itemId} | Zone: {zoneId})");
             }
 
             AddToBuffer(new DropData
@@ -243,7 +328,7 @@ namespace DropLogger.Logic
                 IsHQ = isHq,
                 UserHash = userHash,
                 SourceMob = isMob ? null : sourceMob,
-                SourceMobID = isMob ? null : (int?)sourceMobId
+                SourceMobID = isMob ? null : sourceMobId
             });
         }
 

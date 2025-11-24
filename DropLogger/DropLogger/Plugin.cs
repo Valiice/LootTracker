@@ -19,6 +19,8 @@ namespace DropLogger
         [PluginService] internal static IDataManager Data { get; private set; } = null!;
         [PluginService] internal static IObjectTable ObjectTable { get; private set; } = null!;
         [PluginService] internal static IFramework Framework { get; private set; } = null!;
+        [PluginService] internal static IGameGui GameGui { get; private set; } = null!;
+        [PluginService] internal static IPartyList PartyList { get; private set; } = null!;
 
         private const string _commandName = "/droplog";
         private const string _commandHelpMessage = "Opens the DropLogger configuration window.";
@@ -34,7 +36,7 @@ namespace DropLogger
             Configuration = PluginInterface.GetPluginConfig() as Config ?? new Config();
             Configuration.Initialize(PluginInterface);
 
-            DropTracker = new DropTracker(Configuration, ClientState, PluginLog, Data, ObjectTable, Framework);
+            DropTracker = new DropTracker(Configuration, ClientState, PluginLog, Data, ObjectTable, Framework, GameGui, PartyList);
 
             ConfigWindow = new ConfigWindow(Configuration);
             WindowSystem.AddWindow(ConfigWindow);
