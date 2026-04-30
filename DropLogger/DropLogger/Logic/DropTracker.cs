@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using Dalamud.Game.ClientState.Objects.Types;
+using Dalamud.Game.ClientState.Objects.SubKinds;
 using Dalamud.Game.ClientState.Objects.Enums;
 
 namespace DropLogger.Logic
@@ -18,6 +19,7 @@ namespace DropLogger.Logic
     {
         private readonly Config _config;
         private readonly IClientState _clientState;
+        private readonly IPlayerState _playerState;
         private readonly IPluginLog _pluginLog;
         private readonly IDataManager _data;
         private readonly IObjectTable _objectTable;
@@ -40,10 +42,11 @@ namespace DropLogger.Logic
 
         private readonly HashSet<uint> _seenRollIds = [];
 
-        public DropTracker(Config config, IClientState clientState, IPluginLog pluginLog, IDataManager data, IObjectTable objectTable, IFramework framework, IGameGui gameGui, IPartyList partyList)
+        public DropTracker(Config config, IClientState clientState, IPlayerState playerState, IPluginLog pluginLog, IDataManager data, IObjectTable objectTable, IFramework framework, IGameGui gameGui, IPartyList partyList)
         {
             _config = config;
             _clientState = clientState;
+            _playerState = playerState;
             _pluginLog = pluginLog;
             _data = data;
             _objectTable = objectTable;
@@ -76,7 +79,7 @@ namespace DropLogger.Logic
             GC.SuppressFinalize(this);
         }
 
-        private void OnTerritoryChanged(ushort id)
+        private void OnTerritoryChanged(uint id)
         {
             _deadMobs.Clear();
             _seenRollIds.Clear();
@@ -85,7 +88,7 @@ namespace DropLogger.Logic
         private void OnUpdate(IFramework framework)
         {
             if (!_config.IsLoggingEnabled) return;
-            if (_clientState.LocalPlayer == null) return;
+            if (!_clientState.IsLoggedIn) return;
 
             CheckForKills();
 
@@ -99,7 +102,7 @@ namespace DropLogger.Logic
 
         private void CheckForKills()
         {
-            var player = _clientState.LocalPlayer;
+            var player = _objectTable[0] as IPlayerCharacter;
             if (player == null) return;
 
             foreach (var actor in _objectTable)
@@ -169,7 +172,7 @@ namespace DropLogger.Logic
             for (int i = 0; i < count; i++)
             {
                 var val = values[i];
-                if (val.Type != FFXIVClientStructs.FFXIV.Component.GUI.ValueType.Int) continue;
+                if (val.Type != AtkValueType.Int) continue;
 
                 uint possibleItemId = (uint)val.Int;
                 if (possibleItemId < 100 || possibleItemId > 40000) continue;
@@ -308,8 +311,8 @@ namespace DropLogger.Logic
 
         private void LogAndBuffer(string name, int itemId, int quantity, bool isHq, bool isMob, string sourceMob, int? sourceMobId, string sourceMethod)
         {
-            ushort zoneId = _clientState.TerritoryType;
-            string userHash = _clientState.LocalContentId == 0 ? "000000" : _clientState.LocalContentId.ToString("X");
+            uint zoneId = _clientState.TerritoryType;
+            string userHash = _playerState.ContentId == 0 ? "000000" : _playerState.ContentId.ToString("X");
 
             if (_config.EnableDebugLogging)
             {
@@ -318,7 +321,7 @@ namespace DropLogger.Logic
 
             AddToBuffer(new DropData
             {
-                ZoneID = zoneId,
+                ZoneID = (ushort)zoneId,
                 ItemName = name,
                 ItemID = itemId,
                 Quantity = quantity,
